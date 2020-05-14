@@ -12,15 +12,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.TreeMap;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -70,6 +63,18 @@ public class JmxCollector extends Collector implements Collector.Describable {
 
     private final JmxMBeanPropertyCache jmxMBeanPropertyCache = new JmxMBeanPropertyCache();
 
+    // Now this is a hack to make the first collection try all pattern matches.
+    // Still, certain mbeans conforming to a given whitelist+rule combination might only get registired later. In this
+    // case, we'll scrape them probabilistically.
+    // TODO(robinp-tw): maybe ease the pain a bit by keeping track of newly seen whitelists for a rule. Actually
+    // keeping the whole matrix.
+    private volatile int collectCount = 0;
+
+    // TODO(robinp-tw): clean when there's a config reload... also need to reset collectcount or else.
+    // Would also be nicer if instead Rule we would store the pattern string, so it is not sensitive to instance
+    // equality around reloads.
+    private final Map<Rule, Set<ObjectName>> ruleWhitelistMatches = new HashMap<Rule, Set<ObjectName>>();
+
     public JmxCollector(File in) throws IOException, MalformedObjectNameException {
         configFile = in;
         config = loadConfig((Map<String, Object>)new Yaml().load(new FileReader(in)));
@@ -84,7 +89,34 @@ public class JmxCollector extends Collector implements Collector.Describable {
       config = loadConfig((Map<String, Object>)new Yaml().load(inputStream));
     }
 
-    private void reloadConfig() {
+  private void recordRuleMatchSuccessForWhitelist(Rule rule, List<JmxScraper.WhitelistName> whitelistNames) {
+      synchronized (ruleWhitelistMatches) {
+        if (!ruleWhitelistMatches.containsKey(rule)) {
+          ruleWhitelistMatches.put(rule, new HashSet<ObjectName>());
+        }
+        Set<ObjectName> matchingWhitelists = ruleWhitelistMatches.get(rule);
+        for (JmxScraper.WhitelistName w : whitelistNames) {
+          matchingWhitelists.add(w.whitelistName);
+        }
+      }
+  }
+
+  private boolean previousRuleMatchForAnyWhitelist(Rule rule, List<JmxScraper.WhitelistName> whitelistNames) {
+    synchronized (ruleWhitelistMatches) {
+      if (!ruleWhitelistMatches.containsKey(rule)) {
+        ruleWhitelistMatches.put(rule, new HashSet<ObjectName>());
+      }
+      Set<ObjectName> matchingWhitelists = ruleWhitelistMatches.get(rule);
+      for (JmxScraper.WhitelistName w : whitelistNames) {
+        if (matchingWhitelists.contains(w.whitelistName)) {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+
+  private void reloadConfig() {
       try {
         FileReader fr = new FileReader(configFile);
 
@@ -355,20 +387,33 @@ public class JmxCollector extends Collector implements Collector.Describable {
       }
 
       public void recordBean(
-          String domain,
-          LinkedHashMap<String, String> beanProperties,
-          LinkedList<String> attrKeys,
-          String attrName,
-          String attrType,
-          String attrDescription,
-          Object beanValue) {
+              String domain,
+              List<JmxScraper.WhitelistName> whitelistNames, LinkedHashMap<String, String> beanProperties,
+              LinkedList<String> attrKeys,
+              String attrName,
+              String attrType,
+              String attrDescription,
+              Object beanValue) {
 
         String beanName = domain + angleBrackets(beanProperties.toString()) + angleBrackets(attrKeys.toString());
         // attrDescription tends not to be useful, so give the fully qualified name too.
         String help = attrDescription + " (" + beanName + attrName + ")";
         String attrNameSnakeCase = toSnakeAndLowerCase(attrName);
 
+        boolean forceProbeAll = collectCount == 0;
+
+        //LOGGER.info("RecordBean for " + beanName);
         for (Rule rule : config.rules) {
+          boolean isProbing = false;
+          boolean noWhitelistUsed = whitelistNames.size() == 1 && whitelistNames.get(0).whitelistName == null;
+          if (!noWhitelistUsed && !previousRuleMatchForAnyWhitelist(rule, whitelistNames)) {
+            //LOGGER.warning("RUle " + rule.pattern + " for bean " + beanName + " forceall " + forceAll + " collectCount " + collectCount);
+            if (!forceProbeAll && Math.random() >= 0.05) {
+              continue;
+            }
+            isProbing = true;
+          }
+
           Matcher matcher = null;
           String matchName = beanName + (rule.attrNameSnakeCase ? attrNameSnakeCase : attrName);
           if (rule.pattern != null) {
@@ -376,6 +421,10 @@ public class JmxCollector extends Collector implements Collector.Describable {
             if (!matcher.matches()) {
               continue;
             }
+          }
+
+          if (isProbing) {
+            recordRuleMatchSuccessForWhitelist(rule, whitelistNames);
           }
 
           Number value;
@@ -451,7 +500,7 @@ public class JmxCollector extends Collector implements Collector.Describable {
 
     }
 
-    public List<MetricFamilySamples> collect() {
+  public List<MetricFamilySamples> collect() {
       if (configFile != null) {
         long mtime = configFile.lastModified();
         if (mtime > config.lastUpdate) {
@@ -488,7 +537,10 @@ public class JmxCollector extends Collector implements Collector.Describable {
       samples.add(new MetricFamilySamples.Sample(
           "jmx_scrape_error", new ArrayList<String>(), new ArrayList<String>(), error));
       mfsList.add(new MetricFamilySamples("jmx_scrape_error", Type.GAUGE, "Non-zero if this scrape failed.", samples));
-      return mfsList;
+
+    collectCount += 1;
+
+    return mfsList;
     }
 
     public List<MetricFamilySamples> describe() {

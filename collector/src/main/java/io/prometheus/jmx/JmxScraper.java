@@ -20,14 +20,7 @@ import javax.naming.Context;
 import javax.rmi.ssl.SslRMIClientSocketFactory;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.TreeSet;
+import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -35,16 +28,37 @@ import java.util.logging.Logger;
 class JmxScraper {
     private static final Logger logger = Logger.getLogger(JmxScraper.class.getName());
 
+    static class WhitelistName {
+        // Can be null.
+        public final ObjectName whitelistName;
+
+        public WhitelistName(ObjectName whitelistName) {
+            this.whitelistName = whitelistName;
+        }
+    }
+
+    private static class WhitelistedObjectName {
+
+        // Null if no whitelist was defined in config.
+        public final String whitelistName;
+
+        public final ObjectName objectName;
+
+        public WhitelistedObjectName(String whitelistName, ObjectName objectName) {
+            this.whitelistName = whitelistName;
+            this.objectName = objectName;
+        }
+    }
 
     public static interface MBeanReceiver {
         void recordBean(
-            String domain,
-            LinkedHashMap<String, String> beanProperties,
-            LinkedList<String> attrKeys,
-            String attrName,
-            String attrType,
-            String attrDescription,
-            Object value);
+                String domain,
+                List<WhitelistName> whitelistNames, LinkedHashMap<String, String> beanProperties,
+                LinkedList<String> attrKeys,
+                String attrName,
+                String attrType,
+                String attrDescription,
+                Object value);
     }
 
     private final MBeanReceiver receiver;
@@ -97,9 +111,22 @@ class JmxScraper {
         try {
             // Query MBean names, see #89 for reasons queryMBeans() is used instead of queryNames()
             Set<ObjectName> mBeanNames = new HashSet<ObjectName>();
+            Map<ObjectName, List<WhitelistName>> objectWhitelists = new LinkedHashMap<ObjectName, List<WhitelistName>>();
             for (ObjectName name : whitelistObjectNames) {
                 for (ObjectInstance instance : beanConn.queryMBeans(name, null)) {
-                    mBeanNames.add(instance.getObjectName());
+                    ObjectName objectName = instance.getObjectName();
+                    mBeanNames.add(objectName);
+
+                    // Maintain the set of whitelists the given mbean belongs to.
+                    if (!objectWhitelists.containsKey(objectName)) {
+                        ArrayList<WhitelistName> whitelistNames = new ArrayList<WhitelistName>(1);
+                        // Since we expect an mbean to usually match a single whitelist, we initialize it here inplace
+                        // to space a map lookup. Premature optimization?
+                        whitelistNames.add(new WhitelistName(name));
+                        objectWhitelists.put(objectName, whitelistNames);
+                    } else {
+                        objectWhitelists.get(objectName).add(new WhitelistName(name));
+                    }
                 }
             }
 
@@ -114,7 +141,7 @@ class JmxScraper {
 
             for (ObjectName objectName : mBeanNames) {
                 long start = System.nanoTime();
-                scrapeBean(beanConn, objectName);
+                scrapeBean(beanConn, objectWhitelists.get(objectName), objectName);
                 logger.fine("TIME: " + (System.nanoTime() - start) + " ns for " + objectName.toString());
             }
         } finally {
@@ -124,7 +151,10 @@ class JmxScraper {
         }
     }
 
-    private void scrapeBean(MBeanServerConnection beanConn, ObjectName mbeanName) {
+    private void scrapeBean(MBeanServerConnection beanConn, List<WhitelistName> whitelistNames, ObjectName mbeanName) {
+        if (whitelistNames == null || whitelistNames.isEmpty()) {
+            throw new IllegalStateException("whitelist should not be null or empty for bean: " + mbeanName);
+        }
         MBeanInfo info;
         try {
           info = beanConn.getMBeanInfo(mbeanName);
@@ -162,6 +192,7 @@ class JmxScraper {
             logScrape(mbeanName, attr, "process");
             processBeanValue(
                     mbeanName.getDomain(),
+                    whitelistNames,
                     jmxMBeanPropertyCache.getKeyPropertyList(mbeanName),
                     new LinkedList<String>(),
                     attr.getName(),
@@ -182,7 +213,7 @@ class JmxScraper {
      */
     private void processBeanValue(
             String domain,
-            LinkedHashMap<String, String> beanProperties,
+            List<WhitelistName> whitelistNames, LinkedHashMap<String, String> beanProperties,
             LinkedList<String> attrKeys,
             String attrName,
             String attrType,
@@ -198,6 +229,7 @@ class JmxScraper {
             logScrape(domain + beanProperties + attrName, value.toString());
             this.receiver.recordBean(
                     domain,
+                    whitelistNames,
                     beanProperties,
                     attrKeys,
                     attrName,
@@ -215,6 +247,7 @@ class JmxScraper {
                 Object valu = composite.get(key);
                 processBeanValue(
                         domain,
+                        whitelistNames,
                         beanProperties,
                         attrKeys,
                         key,
@@ -266,7 +299,7 @@ class JmxScraper {
                         } 
                         processBeanValue(
                             domain,
-                            l2s,
+                                whitelistNames, l2s,
                             attrNames,
                             name,
                             typ,
@@ -299,13 +332,14 @@ class JmxScraper {
 
     private static class StdoutWriter implements MBeanReceiver {
         public void recordBean(
-            String domain,
-            LinkedHashMap<String, String> beanProperties,
-            LinkedList<String> attrKeys,
-            String attrName,
-            String attrType,
-            String attrDescription,
-            Object value) {
+                String domain,
+                List<WhitelistName> whitelistNames,
+                LinkedHashMap<String, String> beanProperties,
+                LinkedList<String> attrKeys,
+                String attrName,
+                String attrType,
+                String attrDescription,
+                Object value) {
             System.out.println(domain +
                                beanProperties + 
                                attrKeys +
